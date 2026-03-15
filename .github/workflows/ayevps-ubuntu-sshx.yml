@@ -1,0 +1,119 @@
+name: AyeVPS Ubuntu Terminal - boiz
+on:
+  workflow_dispatch:
+    inputs:
+      session_name:
+        description: 'Session name'
+        required: false
+        default: 'boiz'
+      session_id:
+        description: 'Session ID'
+        required: false
+        default: 'smmrhore2_fbmkvkof'
+      duration:
+        description: 'Duration in minutes'
+        required: false
+        default: '360'
+      startup_script:
+        description: 'Startup script (bash)'
+        required: false
+        default: ''
+
+jobs:
+  ubuntu-terminal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System Info
+        run: |
+          echo "Session: ${{ github.event.inputs.session_name }}"
+          echo "Duration: ${{ github.event.inputs.duration }} minutes"
+          uname -a && free -h && nproc
+
+      - name: Start sshx and Keep Alive
+        run: |
+          set +e
+          curl -sSf https://sshx.io/get | sh
+
+          # Start sshx in background with nohup so it survives
+          nohup sshx > /tmp/sshx_output.txt 2>&1 &
+          SSHX_PID=$!
+          disown $SSHX_PID
+          echo "sshx started with PID $SSHX_PID"
+
+          # Wait for sshx URL to appear
+          SSHX_URL=""
+          for i in $(seq 1 30); do
+            sleep 2
+            if [ -f /tmp/sshx_output.txt ]; then
+              SSHX_URL=$(grep -oE "https://sshx.io/s/[a-zA-Z0-9_#-]+" /tmp/sshx_output.txt | head -1)
+              if [ -n "$SSHX_URL" ]; then
+                echo "Found sshx URL: $SSHX_URL"
+                break
+              fi
+            fi
+            echo "Waiting for sshx URL... attempt $i/30"
+          done
+
+          if [ -z "$SSHX_URL" ]; then
+            echo "WARNING: Could not find sshx URL"
+            echo "sshx output:"
+            cat /tmp/sshx_output.txt 2>/dev/null || echo "(no output)"
+          fi
+
+          echo "::notice::SSHX_URL=$SSHX_URL"
+
+          # Push access info to repo
+          SESSION_ID="${{ github.event.inputs.session_id }}"
+          BRANCH="${{ github.ref_name }}"
+          REPO="${{ github.repository }}"
+          TOKEN="${{ github.token }}"
+          JSON_RAW="{\"type\":\"sshx\",\"url\":\"${SSHX_URL}\",\"ts\":\"$(date -Iseconds)\"}"
+          B64=$(echo -n "$JSON_RAW" | base64 -w 0)
+          API_URL="https://api.github.com/repos/${REPO}/contents/.ayevps/${SESSION_ID}.json"
+
+          # Check if file exists
+          EXISTING=$(curl -s -H "Authorization: token ${TOKEN}" -H "Accept: application/vnd.github.v3+json" "${API_URL}?ref=${BRANCH}")
+          SHA=$(echo "$EXISTING" | grep -o '"sha":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+          if [ -n "$SHA" ]; then
+            curl -s -X PUT -H "Authorization: token ${TOKEN}" -H "Accept: application/vnd.github.v3+json" \
+              "$API_URL" -d "{\"message\":\"ayevps: access info\",\"content\":\"${B64}\",\"branch\":\"${BRANCH}\",\"sha\":\"${SHA}\"}"
+          else
+            curl -s -X PUT -H "Authorization: token ${TOKEN}" -H "Accept: application/vnd.github.v3+json" \
+              "$API_URL" -d "{\"message\":\"ayevps: access info\",\"content\":\"${B64}\",\"branch\":\"${BRANCH}\"}"
+          fi
+          echo "Access info pushed to repo"
+
+          # Run startup script
+          STARTUP="${{ github.event.inputs.startup_script }}"
+          if [ -n "$STARTUP" ]; then
+            echo "Running startup script..."
+            eval "$STARTUP"
+          fi
+
+          # Keep alive loop
+          DURATION="${{ github.event.inputs.duration }}"
+          if [ -z "$DURATION" ] || [ "$DURATION" = "0" ]; then DURATION=360; fi
+          END_TIME=$(($(date +%s) + DURATION * 60))
+          echo "Session will run for $DURATION minutes"
+          while [ $(date +%s) -lt $END_TIME ]; do
+            REMAINING=$(( (END_TIME - $(date +%s)) / 60 ))
+            if kill -0 $SSHX_PID 2>/dev/null; then
+              echo "Alive - Remaining: ${REMAINING} min - sshx: OK (PID $SSHX_PID)"
+            else
+              echo "sshx died! Restarting..."
+              nohup sshx > /tmp/sshx_output.txt 2>&1 &
+              SSHX_PID=$!
+              disown $SSHX_PID
+              sleep 5
+              NEW_URL=$(grep -oE "https://sshx.io/s/[a-zA-Z0-9_#-]+" /tmp/sshx_output.txt | head -1)
+              echo "New sshx URL: $NEW_URL"
+            fi
+            sleep 30
+          done
+          echo "Session expired."
+        shell: bash
